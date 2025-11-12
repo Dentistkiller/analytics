@@ -99,45 +99,40 @@ def _get_txscores_txid_type(conn):
 # ---------- Adaptive upsert ----------
 def upsert_score(eng, tx_id: int, score: float, label_pred: bool):
     """
-    Upsert into ml.TxScores with numeric tx_id (BIGINT).
-    Assumes ml.TxScores.tx_id is BIGINT (as per your migration).
+    Upsert into ml.TxScores assuming tx_id is BIGINT.
+    Avoid MERGE/CAST to prevent 8114 (nvarchar→bigint) binding issues.
     """
     run_id = os.getenv("MODEL_VERSION", "kaggle_v1")
     thr    = float(os.getenv("THRESHOLD", "0.5"))
-    table  = _tbl(SCORE_SCHEMA, SCORE_TABLE)
 
     with eng.begin() as con:
-        # Use MERGE with fully-typed source; keep everything numeric to avoid conversions.
-        con.exec_driver_sql(f"""
-            MERGE {table} AS tgt
-            USING (
-                SELECT
-                    CAST(? AS BIGINT)       AS tx_id,
-                    CAST(? AS FLOAT)        AS score,
-                    CAST(? AS BIT)          AS label_pred,
-                    CAST(? AS FLOAT)        AS threshold,
-                    CAST(? AS NVARCHAR(64)) AS run_id
-            ) AS src
-            ON (tgt.tx_id = src.tx_id)
-            WHEN MATCHED THEN
-                UPDATE SET
-                    score        = src.score,
-                    label_pred   = src.label_pred,
-                    threshold    = src.threshold,
-                    run_id       = src.run_id,
-                    explained_at = SYSUTCDATETIME(),
-                    reason_json  = COALESCE(tgt.reason_json, '{{"source":"model"}}')
-            WHEN NOT MATCHED THEN
-                INSERT (tx_id, score, label_pred, threshold, run_id, explained_at, reason_json)
-                VALUES (src.tx_id, src.score, src.label_pred, src.threshold, src.run_id,
-                        SYSUTCDATETIME(), '{{"source":"model"}}');
-        """, (
-            int(tx_id),
-            float(score),
-            1 if bool(label_pred) else 0,  # ensure true BIT literal
-            thr,
-            run_id
-        ))
+        # 1) UPDATE (no CASTs anywhere)
+        con.exec_driver_sql(
+            """
+            UPDATE [ml].[TxScores]
+               SET score        = ?,
+                   label_pred   = ?,
+                   threshold    = ?,
+                   run_id       = ?,
+                   explained_at = SYSUTCDATETIME(),
+                   reason_json  = COALESCE(reason_json, '{"source":"model"}')
+             WHERE tx_id        = ?;
+            """,
+            (float(score), 1 if label_pred else 0, thr, run_id, int(tx_id)),
+        )
+
+        # 2) If nothing updated, INSERT (again, no CASTs)
+        con.exec_driver_sql(
+            """
+            IF @@ROWCOUNT = 0
+            INSERT INTO [ml].[TxScores]
+                (tx_id, score, label_pred, threshold, run_id, explained_at, reason_json)
+            VALUES
+                (?,     ?,     ?,          ?,         ?,      SYSUTCDATETIME(), '{"source":"model"}');
+            """,
+            (int(tx_id), float(score), 1 if label_pred else 0, thr, run_id),
+        )
+
 
 # ---------- CLI main ----------
 def main():

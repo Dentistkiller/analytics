@@ -1,0 +1,28 @@
+### Test scoring API
+POST https://bizapp-7vc8.onrender.com/score
+Content-Type: application/json
+
+{
+  "tx_id": 720010
+}
+
+### TEST LOCAL
+POST http://127.0.0.1:8000/score
+Content-Type: application/json
+
+{
+  "tx_id": 720010
+}
+
+### health
+GET http://127.0.0.1:8000/health
+
+### diagnostics
+GET http://127.0.0.1:8000/diag
+
+### score (use a real tx_id that exists)
+POST http://127.0.0.1:8000/score
+Content-Type: application/json
+
+{ "tx_id": 12345 }
+

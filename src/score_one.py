@@ -3,7 +3,7 @@ import os
 import json
 import joblib
 import pandas as pd
-from sqlalchemy import text
+from sqlalchemy import text, BigInteger, Float, Boolean, NVARCHAR, bindparam
 from datetime import timedelta
 from .common import sql_engine
 from .features import engineer
@@ -98,42 +98,43 @@ def _get_txscores_txid_type(conn):
 
 # ---------- Adaptive upsert ----------
 def upsert_score(eng, tx_id: int, score: float, label_pred: bool):
-    """
-    Upsert into ml.TxScores assuming tx_id is BIGINT.
-    Avoid MERGE/CAST to prevent 8114 (nvarchar→bigint) binding issues.
-    """
     run_id = os.getenv("MODEL_VERSION", "kaggle_v1")
     thr    = float(os.getenv("THRESHOLD", "0.5"))
 
+    upd_ins = text("""
+        UPDATE [ml].[TxScores]
+           SET score        = :score,
+               label_pred   = :label,
+               threshold    = :thr,
+               run_id       = :run_id,
+               explained_at = SYSUTCDATETIME(),
+               reason_json  = COALESCE(reason_json, '{"source":"model"}')
+         WHERE tx_id        = :tx_id;
+
+        IF @@ROWCOUNT = 0
+        INSERT INTO [ml].[TxScores]
+            (tx_id, score, label_pred, threshold, run_id, explained_at, reason_json)
+        VALUES
+            (:tx_id, :score, :label, :thr, :run_id, SYSUTCDATETIME(), '{"source":"model"}');
+    """).bindparams(
+        bindparam("tx_id",  type_=BigInteger()),
+        bindparam("score",  type_=Float()),
+        bindparam("label",  type_=Boolean()),
+        bindparam("thr",    type_=Float()),
+        bindparam("run_id", type_=NVARCHAR(length=64)),
+    )
+
     with eng.begin() as con:
-        # 1) UPDATE (no CASTs anywhere)
-        con.exec_driver_sql(
-            """
-            UPDATE [ml].[TxScores]
-               SET score        = ?,
-                   label_pred   = ?,
-                   threshold    = ?,
-                   run_id       = ?,
-                   explained_at = SYSUTCDATETIME(),
-                   reason_json  = COALESCE(reason_json, '{"source":"model"}')
-             WHERE tx_id        = ?;
-            """,
-            (float(score), 1 if label_pred else 0, thr, run_id, int(tx_id)),
+        con.execute(
+            upd_ins,
+            {
+                "tx_id":  int(tx_id),
+                "score":  float(score),
+                "label":  bool(label_pred),
+                "thr":    thr,
+                "run_id": run_id,
+            },
         )
-
-        # 2) If nothing updated, INSERT (again, no CASTs)
-        con.exec_driver_sql(
-            """
-            IF @@ROWCOUNT = 0
-            INSERT INTO [ml].[TxScores]
-                (tx_id, score, label_pred, threshold, run_id, explained_at, reason_json)
-            VALUES
-                (?,     ?,     ?,          ?,         ?,      SYSUTCDATETIME(), '{"source":"model"}');
-            """,
-            (int(tx_id), float(score), 1 if label_pred else 0, thr, run_id),
-        )
-
-
 # ---------- CLI main ----------
 def main():
     """

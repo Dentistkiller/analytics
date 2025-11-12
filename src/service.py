@@ -6,7 +6,7 @@ from typing import Optional
 from dotenv import load_dotenv
 load_dotenv()  # load .env before using env vars
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 from fastapi.requests import Request
 from pydantic import BaseModel
@@ -289,6 +289,23 @@ def score_path(tx_id: int):
         return _score_single_tx(tx_id)
     except LookupError as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+@app.post("/diag/write-test")
+def diag_write_test(tx_id: int = Query(..., ge=1)):
+    """
+    Tries INSERT or UPDATE into ml.TxScores for the given tx_id, then reads it back.
+    Useful to confirm the API user has INSERT/UPDATE on ml.TxScores in THIS database.
+    """
+    eng = sql_engine()
+    score = 0.123
+    flagged = False
+    upsert_score(eng, tx_id, score, flagged)
+    with eng.connect() as c:
+        row = c.exec_driver_sql(
+            "SELECT tx_id, score, label_pred FROM ml.TxScores WHERE tx_id = ?", (tx_id,)
+        ).first()
+    return {"wrote": True, "row": {"tx_id": int(row[0]), "score": float(row[1]), "flagged": bool(row[2])}}
+
 
 @app.post("/score", response_model=ScoreResponse)
 def score_body(req: TxRequest):

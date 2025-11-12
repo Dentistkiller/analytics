@@ -2,27 +2,32 @@
 FROM python:3.11-slim
 
 ENV ACCEPT_EULA=Y \
-    DEBIAN_FRONTEND=noninteractive
+    DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
-# ODBC + build deps
+# System deps + ODBC
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl gnupg2 ca-certificates \
-    gcc g++ make \
     unixodbc unixodbc-dev \
-    && rm -rf /var/lib/apt/lists/*
+    gcc g++ make \
+  && rm -rf /var/lib/apt/lists/*
 
-# MS ODBC 18 (official)
+# Microsoft ODBC Driver 18 for SQL Server
 RUN curl https://packages.microsoft.com/keys/microsoft.asc | apt-key add - && \
     curl https://packages.microsoft.com/config/debian/12/prod.list > /etc/apt/sources.list.d/mssql-release.list && \
     apt-get update && ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql18 && \
     rm -rf /var/lib/apt/lists/*
 
+# Workdir
 WORKDIR /app
+
+# Install Python deps
 COPY requirements.txt /app/
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
-# copy your analytics code
-COPY analytics/ /app/
+# Copy the whole project (since repo root already has src/, models/, etc.)
+COPY . /app/
 
 # Expose and run
 ENV PORT=8000

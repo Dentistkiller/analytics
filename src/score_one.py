@@ -1,4 +1,3 @@
-# analytics/src/score_one.py
 import os
 import json
 import joblib
@@ -77,7 +76,7 @@ def fetch_context(eng, tx_id: int) -> pd.DataFrame:
 
     return ctx
 
-# ---------- Inspect tx_id column type ----------
+# ---------- Inspect tx_id column type (kept for diagnostics) ----------
 def _get_txscores_txid_type(conn):
     """
     Returns (data_type, max_length) for SCORE_SCHEMA.SCORE_TABLE.tx_id.
@@ -100,15 +99,16 @@ def _get_txscores_txid_type(conn):
 def upsert_score(eng, tx_id: int, score: float, label_pred: bool):
     run_id = os.getenv("MODEL_VERSION", "kaggle_v1")
     thr    = float(os.getenv("THRESHOLD", "0.5"))
+    tbl    = _tbl(SCORE_SCHEMA, SCORE_TABLE)
 
-    upd = text("""
-        UPDATE [ml].[TxScores]
+    upd = text(f"""
+        UPDATE {tbl}
            SET score        = :score,
                label_pred   = :label,
                threshold    = :thr,
                run_id       = :run_id,
                explained_at = SYSUTCDATETIME(),
-               reason_json  = COALESCE(reason_json, '{"source":"model"}')
+               reason_json  = COALESCE(reason_json, '{{"source":"model"}}')
          WHERE tx_id = :tx_id;
     """).bindparams(
         bindparam("tx_id",  type_=BigInteger()),
@@ -118,11 +118,11 @@ def upsert_score(eng, tx_id: int, score: float, label_pred: bool):
         bindparam("run_id", type_=NVARCHAR(length=64)),
     )
 
-    ins = text("""
-        INSERT INTO [ml].[TxScores]
+    ins = text(f"""
+        INSERT INTO {tbl}
             (tx_id, score, label_pred, threshold, run_id, explained_at, reason_json)
         VALUES
-            (:tx_id, :score, :label, :thr, :run_id, SYSUTCDATETIME(), '{"source":"model"}');
+            (:tx_id, :score, :label, :thr, :run_id, SYSUTCDATETIME(), '{{"source":"model"}}');
     """).bindparams(
         bindparam("tx_id",  type_=BigInteger()),
         bindparam("score",  type_=Float()),
@@ -147,6 +147,7 @@ def upsert_score(eng, tx_id: int, score: float, label_pred: bool):
                 "thr":   thr,
                 "run_id": run_id,
             })
+
 # ---------- CLI main ----------
 def main():
     """

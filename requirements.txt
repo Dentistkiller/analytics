@@ -11,4 +11,3 @@ fastapi
 uvicorn[standard]
 pydantic
 joblib
-pymsql

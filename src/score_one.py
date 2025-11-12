@@ -9,17 +9,27 @@ from .common import sql_engine
 from .features import engineer
 
 # -------- Configuration --------
-MODEL_PATH    = os.getenv("MODEL_PATH", "models/model_kaggle.pkl")
-SCORE_SCHEMA  = os.getenv("SCORE_SCHEMA", "ml")
-SCORE_TABLE   = os.getenv("SCORE_TABLE",  "TxScores")
-TS_FMT        = "%Y-%m-%d %H:%M:%S"
+MODEL_PATH   = os.getenv("MODEL_PATH", "models/model_kaggle.pkl")
+SCORE_SCHEMA = os.getenv("SCORE_SCHEMA", "ml")
+SCORE_TABLE  = os.getenv("SCORE_TABLE",  "TxScores")
+TS_FMT       = "%Y-%m-%d %H:%M:%S"
 
+# ---------- Small SQL helpers ----------
+def _qn(name: str) -> str:
+    """Quote a SQL Server identifier with brackets."""
+    return f"[{name}]"
+
+def _tbl(schema: str, table: str) -> str:
+    return f"{_qn(schema)}.{_qn(table)}"
+
+# ---------- Bundle ----------
 def load_bundle():
     """Load the trained bundle (model, threshold, features...)."""
     if not os.path.exists(MODEL_PATH):
         raise FileNotFoundError(f"Model bundle not found at {MODEL_PATH}")
     return joblib.load(MODEL_PATH)
 
+# ---------- Fetch context ----------
 def fetch_context(eng, tx_id: int) -> pd.DataFrame:
     """
     Fetch the target transaction plus a small recent context window.
@@ -66,35 +76,124 @@ def fetch_context(eng, tx_id: int) -> pd.DataFrame:
         ctx["label"] = 0
 
     return ctx
+
+# ---------- Inspect tx_id column type ----------
+def _get_txscores_txid_type(conn):
+    """
+    Returns (data_type, max_length) for SCORE_SCHEMA.SCORE_TABLE.tx_id.
+    data_type examples: 'bigint', 'int', 'numeric', 'decimal', 'nvarchar', 'varchar'
+    max_length: for character types; None/NULL for numeric.
+    """
+    row = conn.exec_driver_sql(f"""
+        SELECT DATA_TYPE, CHARACTER_MAXIMUM_LENGTH
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = '{SCORE_SCHEMA}'
+          AND TABLE_NAME  = '{SCORE_TABLE}'
+          AND COLUMN_NAME = 'tx_id'
+    """).first()
+    if not row:
+        # Fallback: assume BIGINT like ops.Transactions.tx_id
+        return ("bigint", None)
+    return (str(row[0]).lower(), row[1])
+
+# ---------- Adaptive upsert ----------
 def upsert_score(eng, tx_id: int, score: float, label_pred: bool):
     run_id = os.getenv("MODEL_VERSION", "kaggle_v1")
     thr    = float(os.getenv("THRESHOLD", "0.5"))
+    table  = _tbl(SCORE_SCHEMA, SCORE_TABLE)
 
     with eng.begin() as con:
-        con.exec_driver_sql("""
-        MERGE [ml].[TxScores] AS tgt
-        USING (
-            SELECT
-                CAST(? AS NVARCHAR(50)) AS tx_id,      -- cast source to NVARCHAR
-                CAST(? AS FLOAT)         AS score,
-                CAST(? AS BIT)           AS label_pred,
-                CAST(? AS FLOAT)         AS threshold,
-                CAST(? AS NVARCHAR(64))  AS run_id
-        ) AS src
-        ON (tgt.tx_id = src.tx_id)                      -- string compare if tgt is NVARCHAR
-        WHEN MATCHED THEN
-            UPDATE SET
-                score        = src.score,
-                label_pred   = src.label_pred,
-                threshold    = src.threshold,
-                run_id       = src.run_id,
-                explained_at = SYSUTCDATETIME(),
-                reason_json  = COALESCE(tgt.reason_json, '{\"source\":\"model\"}')
-        WHEN NOT MATCHED THEN
-            INSERT (tx_id, score, label_pred, threshold, run_id, explained_at, reason_json)
-            VALUES (src.tx_id, src.score, src.label_pred, src.threshold, src.run_id, SYSUTCDATETIME(), '{\"source\":\"model\"}');
-        """, (int(tx_id), float(score), bool(label_pred), thr, run_id))
+        dtype, maxlen = _get_txscores_txid_type(con)
+        char_len = maxlen if (isinstance(maxlen, int) and maxlen and maxlen > 0) else 50
 
+        numeric_types = {"bigint", "int", "numeric", "decimal", "smallint", "tinyint"}
+        string_types  = {"nvarchar", "varchar", "nchar", "char"}
+
+        if dtype in numeric_types:
+            # Target tx_id is numeric: keep everything numeric to avoid string->bigint coercion.
+            con.exec_driver_sql(f"""
+                MERGE {table} AS tgt
+                USING (
+                    SELECT
+                        CAST(? AS BIGINT)       AS tx_id,
+                        CAST(? AS FLOAT)        AS score,
+                        CAST(? AS BIT)          AS label_pred,
+                        CAST(? AS FLOAT)        AS threshold,
+                        CAST(? AS NVARCHAR(64)) AS run_id
+                ) AS src
+                ON (tgt.tx_id = src.tx_id)
+                WHEN MATCHED THEN
+                    UPDATE SET
+                        score        = src.score,
+                        label_pred   = src.label_pred,
+                        threshold    = src.threshold,
+                        run_id       = src.run_id,
+                        explained_at = SYSUTCDATETIME(),
+                        reason_json  = COALESCE(tgt.reason_json, '{{"source":"model"}}')
+                WHEN NOT MATCHED THEN
+                    INSERT (tx_id, score, label_pred, threshold, run_id, explained_at, reason_json)
+                    VALUES (src.tx_id, src.score, src.label_pred, src.threshold, src.run_id,
+                            SYSUTCDATETIME(), '{{"source":"model"}}');
+            """, (int(tx_id), float(score), int(bool(label_pred)), thr, run_id))
+
+        elif dtype in string_types:
+            # Target tx_id is text: compare and insert as NVARCHAR explicitly, and
+            # cast TARGET on the ON to the same length to avoid implicit conversions.
+            con.exec_driver_sql(f"""
+                MERGE {table} AS tgt
+                USING (
+                    SELECT
+                        CAST(? AS NVARCHAR({char_len})) AS tx_id,
+                        CAST(? AS FLOAT)                 AS score,
+                        CAST(? AS BIT)                   AS label_pred,
+                        CAST(? AS FLOAT)                 AS threshold,
+                        CAST(? AS NVARCHAR(64))          AS run_id
+                ) AS src
+                ON (CAST(tgt.tx_id AS NVARCHAR({char_len})) = src.tx_id)
+                WHEN MATCHED THEN
+                    UPDATE SET
+                        score        = src.score,
+                        label_pred   = src.label_pred,
+                        threshold    = src.threshold,
+                        run_id       = src.run_id,
+                        explained_at = SYSUTCDATETIME(),
+                        reason_json  = COALESCE(tgt.reason_json, '{{"source":"model"}}')
+                WHEN NOT MATCHED THEN
+                    INSERT (tx_id, score, label_pred, threshold, run_id, explained_at, reason_json)
+                    VALUES (src.tx_id, src.score, src.label_pred, src.threshold, src.run_id,
+                            SYSUTCDATETIME(), '{{"source":"model"}}');
+            """, (str(tx_id), float(score), int(bool(label_pred)), thr, run_id))
+
+        else:
+            # Exotic type: fall back to UPDATE + INSERT without MERGE.
+            if dtype in string_types:
+                con.exec_driver_sql(f"""
+                    UPDATE {table}
+                    SET score = ?, label_pred = ?, threshold = ?, run_id = ?,
+                        explained_at = SYSUTCDATETIME(),
+                        reason_json  = COALESCE(reason_json, '{{"source":"model"}}')
+                    WHERE CAST(tx_id AS NVARCHAR({char_len})) = CAST(? AS NVARCHAR({char_len}));
+
+                    IF @@ROWCOUNT = 0
+                    INSERT INTO {table} (tx_id, score, label_pred, threshold, run_id, explained_at, reason_json)
+                    VALUES (CAST(? AS NVARCHAR({char_len})), ?, ?, ?, ?, SYSUTCDATETIME(), '{{"source":"model"}}');
+                """, (float(score), int(bool(label_pred)), thr, run_id, str(tx_id),
+                      str(tx_id), float(score), int(bool(label_pred)), thr, run_id))
+            else:
+                con.exec_driver_sql(f"""
+                    UPDATE {table}
+                    SET score = ?, label_pred = ?, threshold = ?, run_id = ?,
+                        explained_at = SYSUTCDATETIME(),
+                        reason_json  = COALESCE(reason_json, '{{"source":"model"}}')
+                    WHERE tx_id = CAST(? AS BIGINT);
+
+                    IF @@ROWCOUNT = 0
+                    INSERT INTO {table} (tx_id, score, label_pred, threshold, run_id, explained_at, reason_json)
+                    VALUES (CAST(? AS BIGINT), ?, ?, ?, ?, SYSUTCDATETIME(), '{{"source":"model"}}');
+                """, (float(score), int(bool(label_pred)), thr, run_id, int(tx_id),
+                      int(tx_id), float(score), int(bool(label_pred)), thr, run_id))
+
+# ---------- CLI main ----------
 def main():
     """
     CLI usage (optional): python -m src.score_one <tx_id>
@@ -130,6 +229,7 @@ def main():
     if row_index is None:
         row_index = X.index[-1]
 
+    # Score
     if hasattr(model, "predict_proba"):
         score = float(model.predict_proba(X)[row_index, 1])
     elif hasattr(model, "decision_function"):

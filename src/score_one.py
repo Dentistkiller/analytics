@@ -101,7 +101,7 @@ def upsert_score(eng, tx_id: int, score: float, label_pred: bool):
     run_id = os.getenv("MODEL_VERSION", "kaggle_v1")
     thr    = float(os.getenv("THRESHOLD", "0.5"))
 
-    upd_ins = text("""
+    upd = text("""
         UPDATE [ml].[TxScores]
            SET score        = :score,
                label_pred   = :label,
@@ -109,9 +109,16 @@ def upsert_score(eng, tx_id: int, score: float, label_pred: bool):
                run_id       = :run_id,
                explained_at = SYSUTCDATETIME(),
                reason_json  = COALESCE(reason_json, '{"source":"model"}')
-         WHERE tx_id        = :tx_id;
+         WHERE tx_id = :tx_id;
+    """).bindparams(
+        bindparam("tx_id",  type_=BigInteger()),
+        bindparam("score",  type_=Float()),
+        bindparam("label",  type_=Boolean()),
+        bindparam("thr",    type_=Float()),
+        bindparam("run_id", type_=NVARCHAR(length=64)),
+    )
 
-        IF @@ROWCOUNT = 0
+    ins = text("""
         INSERT INTO [ml].[TxScores]
             (tx_id, score, label_pred, threshold, run_id, explained_at, reason_json)
         VALUES
@@ -125,16 +132,21 @@ def upsert_score(eng, tx_id: int, score: float, label_pred: bool):
     )
 
     with eng.begin() as con:
-        con.execute(
-            upd_ins,
-            {
-                "tx_id":  int(tx_id),
-                "score":  float(score),
-                "label":  bool(label_pred),
-                "thr":    thr,
+        res = con.execute(upd, {
+            "tx_id": int(tx_id),
+            "score": float(score),
+            "label": bool(label_pred),
+            "thr":   thr,
+            "run_id": run_id,
+        })
+        if res.rowcount == 0:
+            con.execute(ins, {
+                "tx_id": int(tx_id),
+                "score": float(score),
+                "label": bool(label_pred),
+                "thr":   thr,
                 "run_id": run_id,
-            },
-        )
+            })
 # ---------- CLI main ----------
 def main():
     """

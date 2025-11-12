@@ -1,113 +1,72 @@
 # analytics/src/score_one.py
-import os, sys, json, joblib
+import os
+import pickle
+from urllib.parse import quote_plus
+
 import pandas as pd
-from sqlalchemy import text
-from datetime import datetime, timedelta
-from .common import sql_engine
-from .features import engineer
 
-
-
-MODEL_PATH = os.getenv("MODEL_PATH", "models/model_kaggle.pkl")
-TS_FMT = "%Y-%m-%d %H:%M:%S"
-
+# --- Loading the trained bundle ---
 def load_bundle():
-    if not os.path.exists(MODEL_PATH):
-        print(f"ERR: model bundle not found at {MODEL_PATH}", file=sys.stderr)
-        sys.exit(2)
-    return joblib.load(MODEL_PATH)
+    model_path = os.getenv("MODEL_PATH", "models/model_kaggle.pkl")
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model bundle not found at {model_path}")
+    with open(model_path, "rb") as f:
+        bundle = pickle.load(f)
+    return bundle
 
-def fetch_context(eng, tx_id: int):
-    # Pull the target row
-    tx = pd.read_sql(text("""
-        SELECT * FROM ops.Transactions WHERE tx_id = :id
-    """), eng, params={"id": tx_id})
-    if tx.empty:
-        print(f"ERR: tx_id {tx_id} not found", file=sys.stderr)
-        sys.exit(3)
-
-    # Parse timestamp (string) for a lookback
-    tx_utc = pd.to_datetime(tx.iloc[0]["tx_utc"], format=TS_FMT, utc=True, errors="coerce")
-    if pd.isna(tx_utc):
-        # if parsing fails, just use a wide window
-        tx_utc = pd.Timestamp.utcnow()
-
-    card_id = int(tx.iloc[0]["card_id"])
-    cust_id = int(tx.iloc[0]["customer_id"])
-
-    # Pull recent history for same card + same customer (30 days window)
-    since = (tx_utc - pd.Timedelta(days=30)).strftime(TS_FMT)
-    ctx = pd.read_sql(text(f"""
-        SELECT *
-        FROM ops.Transactions
-        WHERE (card_id = :card OR customer_id = :cust)
-          AND tx_utc >= :since
-          AND tx_id <= :id
-        ORDER BY tx_utc, tx_id
-    """), eng, params={"card": card_id, "cust": cust_id, "since": since, "id": tx_id})
-
-    # Ensure target row is present
-    if ctx[ctx["tx_id"] == tx_id].empty:
-        ctx = pd.concat([ctx, tx], ignore_index=True)
-
-    # Add a dummy label column (engineer expects it when is_training=True sometimes)
-    if "label" not in ctx.columns:
-        ctx["label"] = 0
-
-    return ctx
-
-def upsert_score(eng, tx_id: int, score: float, label_pred: bool):
-    with eng.begin() as con:
-        # Try update, else insert
-        rows = con.execute(text("""
-            UPDATE ml.TxScores
-            SET score = :score, label_pred = :label_pred,
-                reason_json = COALESCE(reason_json,'{"source":"model"}')
-            WHERE tx_id = :id;
-            SELECT @@ROWCOUNT AS rc;
-        """), {"id": tx_id, "score": float(score), "label_pred": bool(label_pred)}).fetchone()
-        if rows and rows.rc == 0:
-            con.execute(text("""
-                INSERT INTO ml.TxScores (tx_id, score, label_pred, reason_json)
-                VALUES (:id, :score, :label_pred, '{"source":"model"}');
-            """), {"id": tx_id, "score": float(score), "label_pred": bool(label_pred)})
-
-def main():
-    if len(sys.argv) < 2:
+# --- Simple context fetch (service.py already has a safe fallback) ---
+def fetch_context(engine, tx_id: int) -> pd.DataFrame:
+    # This SELECT is simple; service.py will fall back to _fetch_context_safe() if anything fails.
+    with engine.connect() as c:
+        # Detect the PK/ID column at runtime from service.py; here we assume TxId or tx_id exists,
+        # but service.py will catch and fallback if not.
+        # Pull the exact tx row plus a small history window, if desired.
+        df = pd.read_sql_query(
+            f"SELECT TOP 1 * FROM [ops].[Transactions] WHERE [tx_id] = {int(tx_id)}",
+            engine,
+        )
+    if df.empty:
         raise LookupError(f"tx_id {tx_id} not found")
+    return df
 
-    tx_id = int(sys.argv[1])
-    eng = sql_engine()
-    bundle = load_bundle()
+# --- Upsert the score into ml.TxScores explicitly (SQL Server, SA 2.x-safe) ---
+def upsert_score(engine, tx_id: int, score: float, flagged: bool):
+    """
+    Writes/updates the score for a transaction to [ml].[TxScores].
+    Uses MERGE with parameter binding (pyodbc '?').
+    """
+    schema = os.getenv("SCORE_SCHEMA", "ml")
+    table  = os.getenv("SCORE_TABLE",  "TxScores")
+    threshold = float(os.getenv("THRESHOLD", "0.5"))
+    run_id    = os.getenv("MODEL_VERSION", "unknown")
 
-    # bundle: { which, model, threshold, features, ... }
-    model = bundle["model"]
-    thr = float(bundle.get("threshold", 0.5))
-    feat_cols = bundle["features"]
+    def q(name: str) -> str:
+        return f"[{name}]"
 
-    df = fetch_context(eng, tx_id)
-    # Build features for ALL rows, then pick target row at the end
-    X, _, meta, _ = engineer(df, is_training=False)
+    merge_sql = f"""
+MERGE {q(schema)}.{q(table)} AS tgt
+USING (
+    SELECT
+        CAST(? AS BIGINT)       AS tx_id,
+        CAST(? AS FLOAT)        AS score,
+        CAST(? AS BIT)          AS label_pred,
+        CAST(? AS FLOAT)        AS threshold,
+        CAST(? AS NVARCHAR(64)) AS run_id
+) AS src
+ON (tgt.tx_id = src.tx_id)
+WHEN MATCHED THEN
+    UPDATE SET
+        score       = src.score,
+        label_pred  = src.label_pred,
+        threshold   = src.threshold,
+        run_id      = src.run_id,
+        explained_at = SYSUTCDATETIME()
+WHEN NOT MATCHED THEN
+    INSERT (tx_id, score, label_pred, threshold, run_id, explained_at)
+    VALUES (src.tx_id, src.score, src.label_pred, src.threshold, src.run_id, SYSUTCDATETIME());
+"""
 
-    # Align features to training columns (add missing, drop extras)
-    for col in feat_cols:
-        if col not in X.columns:
-            X[col] = 0.0
-    X = X[feat_cols].fillna(0.0)
-
-    # Score all; take the last row that corresponds to tx_id
-    # (context ordered by time, but we ensure meta has tx_id)
-    idx = meta.index[meta["tx_id"] == tx_id]
-    if len(idx) == 0:
-        # fallback: last row
-        idx = [X.index[-1]]
-
-    y_score_all = model.predict_proba(X)[:, 1] if hasattr(model, "predict_proba") else model.decision_function(X)
-    score = float(y_score_all[idx[-1]])
-    label_pred = score >= thr
-
-    upsert_score(eng, tx_id, score, label_pred)
-    print(json.dumps({"tx_id": tx_id, "score": score, "label_pred": bool(label_pred)}))
-
-if __name__ == "__main__":
-    main()
+    params = (int(tx_id), float(score), 1 if flagged else 0, threshold, run_id)
+    # Use a transaction so the write is committed even if the connection pool recycles.
+    with engine.begin() as conn:
+        conn.exec_driver_sql(merge_sql, params)

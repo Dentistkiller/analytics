@@ -1,4 +1,3 @@
-# analytics/src/service.py
 import os
 import traceback
 from typing import Optional
@@ -24,12 +23,17 @@ app = FastAPI(title="VeriPay Scoring API", version=os.getenv("MODEL_VERSION", "u
 # -------- Config: source transactions table --------
 TX_SCHEMA = os.getenv("TX_SCHEMA", "ops")
 TX_TABLE  = os.getenv("TX_TABLE",  "Transactions")
+SCORE_SCHEMA = os.getenv("SCORE_SCHEMA", "ml")
+SCORE_TABLE  = os.getenv("SCORE_TABLE",  "TxScores")
 
 def _qn(name: str) -> str:
     return f"[{name}]"
 
 def _table_2part(schema: str, table: str) -> str:
     return f"{_qn(schema)}.{_qn(table)}"
+
+def _score_tbl() -> str:
+    return _table_2part(SCORE_SCHEMA, SCORE_TABLE)
 
 # -------- Request/Response models --------
 class ScoreResponse(BaseModel):
@@ -215,12 +219,10 @@ def whoami():
 @app.get("/scores/get/{tx_id}")
 def get_score(tx_id: int):
     eng = sql_engine()
-    schema = os.getenv("SCORE_SCHEMA", "ml")
-    table  = os.getenv("SCORE_TABLE",  "TxScores")
     with eng.connect() as c:
         row = c.exec_driver_sql(
             f"SELECT tx_id, score, label_pred, threshold, run_id, explained_at "
-            f"FROM [{schema}].[{table}] WHERE tx_id = ?", (tx_id,)
+            f"FROM {_score_tbl()} WHERE tx_id = ?", (tx_id,)
         ).first()
         if not row:
             return {"found": False}
@@ -291,7 +293,6 @@ def score_path(tx_id: int):
     except LookupError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
-
 @app.post("/diag/write-test")
 def diag_write_test(tx_id: int = Query(...)):
     eng = sql_engine()
@@ -299,15 +300,16 @@ def diag_write_test(tx_id: int = Query(...)):
     flagged = False
     thr    = float(os.getenv("THRESHOLD", "0.5"))
     run_id = os.getenv("MODEL_VERSION", "kaggle_v1")
+    tbl    = _score_tbl()
 
-    upd_sql = text("""
-        UPDATE [ml].[TxScores]
+    upd_sql = text(f"""
+        UPDATE {tbl}
            SET score        = :score,
                label_pred   = :label,
                threshold    = :thr,
                run_id       = :run_id,
                explained_at = SYSUTCDATETIME(),
-               reason_json  = COALESCE(reason_json, '{"source":"model"}')
+               reason_json  = COALESCE(reason_json, '{{"source":"model"}}')
          WHERE tx_id = :tx_id;
     """).bindparams(
         bindparam("tx_id",  type_=BigInteger()),
@@ -317,11 +319,11 @@ def diag_write_test(tx_id: int = Query(...)):
         bindparam("run_id", type_=NVARCHAR(length=64)),
     )
 
-    ins_sql = text("""
-        INSERT INTO [ml].[TxScores]
+    ins_sql = text(f"""
+        INSERT INTO {tbl}
             (tx_id, score, label_pred, threshold, run_id, explained_at, reason_json)
         VALUES
-            (:tx_id, :score, :label, :thr, :run_id, SYSUTCDATETIME(), '{"source":"model"}');
+            (:tx_id, :score, :label, :thr, :run_id, SYSUTCDATETIME(), '{{"source":"model"}}');
     """).bindparams(
         bindparam("tx_id",  type_=BigInteger()),
         bindparam("score",  type_=Float()),
@@ -332,9 +334,9 @@ def diag_write_test(tx_id: int = Query(...)):
 
     sel_sql = text("""
         SELECT tx_id, score, label_pred
-        FROM [ml].[TxScores]
+        FROM {tbl}
         WHERE tx_id = :tx_id;
-    """).bindparams(bindparam("tx_id", type_=BigInteger()))
+    """.format(tbl=tbl)).bindparams(bindparam("tx_id", type_=BigInteger()))
 
     params = {
         "tx_id":  int(tx_id),
@@ -354,12 +356,11 @@ def diag_write_test(tx_id: int = Query(...)):
         return {
             "wrote": False,
             "reason": "Row not visible after write (DB mismatch/permissions).",
-            "db_hint": {"api_db": os.getenv("SQL_DB"), "table": "ml.TxScores", "tx_id": tx_id}
+            "db_hint": {"api_db": os.getenv("SQL_DB"), "table": f"{SCORE_SCHEMA}.{SCORE_TABLE}", "tx_id": tx_id}
         }
 
     return {"wrote": True, "row": {"tx_id": int(row[0]), "score": float(row[1]), "flagged": bool(row[2])}}
 
-    
 @app.post("/score", response_model=ScoreResponse)
 def score_body(req: TxRequest):
     try:

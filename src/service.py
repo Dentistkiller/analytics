@@ -12,6 +12,7 @@ from fastapi.requests import Request
 from pydantic import BaseModel
 
 import pandas as pd
+from sqlalchemy import text, BigInteger, Float, Boolean, NVARCHAR, bindparam
 from sqlalchemy.exc import ResourceClosedError, ProgrammingError
 
 from .common import sql_engine
@@ -291,20 +292,70 @@ def score_path(tx_id: int):
         raise HTTPException(status_code=404, detail=str(e))
 
 @app.post("/diag/write-test")
-def diag_write_test(tx_id: int = Query(..., ge=1)):
-    """
-    Tries INSERT or UPDATE into ml.TxScores for the given tx_id, then reads it back.
-    Useful to confirm the API user has INSERT/UPDATE on ml.TxScores in THIS database.
-    """
+def diag_write_test(tx_id: int = Query(..., description="existing tx_id to test write")):
     eng = sql_engine()
     score = 0.123
     flagged = False
-    upsert_score(eng, tx_id, score, flagged)
-    with eng.connect() as c:
-        row = c.exec_driver_sql(
-            "SELECT tx_id, score, label_pred FROM ml.TxScores WHERE tx_id = ?", (tx_id,)
-        ).first()
-    return {"wrote": True, "row": {"tx_id": int(row[0]), "score": float(row[1]), "flagged": bool(row[2])}}
+    thr = float(os.getenv("THRESHOLD", "0.5"))
+    run_id = os.getenv("MODEL_VERSION", "kaggle_v1")
+
+    # One round-trip: UPDATE/INSERT with OUTPUT into a table var, then SELECT it back.
+    stmt = text("""
+        DECLARE @out TABLE (tx_id BIGINT, score FLOAT, label_pred BIT);
+
+        UPDATE [ml].[TxScores]
+           SET score        = :score,
+               label_pred   = :label,
+               threshold    = :thr,
+               run_id       = :run_id,
+               explained_at = SYSUTCDATETIME(),
+               reason_json  = COALESCE(reason_json, '{"source":"model"}')
+         OUTPUT inserted.tx_id, inserted.score, inserted.label_pred INTO @out
+         WHERE tx_id = :tx_id;
+
+        IF @@ROWCOUNT = 0
+        BEGIN
+            INSERT INTO [ml].[TxScores]
+                (tx_id, score, label_pred, threshold, run_id, explained_at, reason_json)
+            OUTPUT inserted.tx_id, inserted.score, inserted.label_pred INTO @out
+            VALUES
+                (:tx_id, :score, :label, :thr, :run_id, SYSUTCDATETIME(), '{"source":"model"}');
+        END
+
+        SELECT TOP(1) tx_id, score, label_pred FROM @out;
+    """).bindparams(
+        bindparam("tx_id",  type_=BigInteger()),
+        bindparam("score",  type_=Float()),
+        bindparam("label",  type_=Boolean()),
+        bindparam("thr",    type_=Float()),
+        bindparam("run_id", type_=NVARCHAR(length=64)),
+    )
+
+    with eng.begin() as con:
+        row = con.execute(stmt, {
+            "tx_id":  int(tx_id),
+            "score":  float(score),
+            "label":  bool(flagged),
+            "thr":    thr,
+            "run_id": run_id,
+        }).first()
+
+    if not row:
+        # Return a clear diagnostic instead of crashing with NoneType
+        return {
+            "wrote": False,
+            "reason": "No row returned from OUTPUT (possible DB mismatch or permissions).",
+            "db_hint": {
+                "api_db": os.getenv("SQL_DB"),
+                "table": "ml.TxScores",
+                "tx_id": tx_id
+            }
+        }
+
+    return {
+        "wrote": True,
+        "row": {"tx_id": int(row[0]), "score": float(row[1]), "flagged": bool(row[2])}
+    }
 
 
 @app.post("/score", response_model=ScoreResponse)

@@ -292,11 +292,15 @@ def score_path(tx_id: int):
         raise HTTPException(status_code=404, detail=str(e))
 
 
-def upsert_score(eng, tx_id: int, score: float, label_pred: bool):
-    run_id = os.getenv("MODEL_VERSION", "kaggle_v1")
+@app.post("/diag/write-test")
+def diag_write_test(tx_id: int = Query(...)):
+    eng = sql_engine()
+    score  = 0.123
+    flagged = False
     thr    = float(os.getenv("THRESHOLD", "0.5"))
+    run_id = os.getenv("MODEL_VERSION", "kaggle_v1")
 
-    upd = text("""
+    upd_sql = text("""
         UPDATE [ml].[TxScores]
            SET score        = :score,
                label_pred   = :label,
@@ -313,7 +317,7 @@ def upsert_score(eng, tx_id: int, score: float, label_pred: bool):
         bindparam("run_id", type_=NVARCHAR(length=64)),
     )
 
-    ins = text("""
+    ins_sql = text("""
         INSERT INTO [ml].[TxScores]
             (tx_id, score, label_pred, threshold, run_id, explained_at, reason_json)
         VALUES
@@ -326,22 +330,35 @@ def upsert_score(eng, tx_id: int, score: float, label_pred: bool):
         bindparam("run_id", type_=NVARCHAR(length=64)),
     )
 
+    sel_sql = text("""
+        SELECT tx_id, score, label_pred
+        FROM [ml].[TxScores]
+        WHERE tx_id = :tx_id;
+    """).bindparams(bindparam("tx_id", type_=BigInteger()))
+
+    params = {
+        "tx_id":  int(tx_id),
+        "score":  float(score),
+        "label":  bool(flagged),
+        "thr":    thr,
+        "run_id": run_id,
+    }
+
     with eng.begin() as con:
-        res = con.execute(upd, {
-            "tx_id": int(tx_id),
-            "score": float(score),
-            "label": bool(label_pred),
-            "thr":   thr,
-            "run_id": run_id,
-        })
-        if res.rowcount == 0:
-            con.execute(ins, {
-                "tx_id": int(tx_id),
-                "score": float(score),
-                "label": bool(label_pred),
-                "thr":   thr,
-                "run_id": run_id,
-            })
+        upd_res = con.execute(upd_sql, params)
+        if upd_res.rowcount == 0:
+            con.execute(ins_sql, params)
+        row = con.execute(sel_sql, {"tx_id": int(tx_id)}).first()
+
+    if not row:
+        return {
+            "wrote": False,
+            "reason": "Row not visible after write (DB mismatch/permissions).",
+            "db_hint": {"api_db": os.getenv("SQL_DB"), "table": "ml.TxScores", "tx_id": tx_id}
+        }
+
+    return {"wrote": True, "row": {"tx_id": int(row[0]), "score": float(row[1]), "flagged": bool(row[2])}}
+
     
 @app.post("/score", response_model=ScoreResponse)
 def score_body(req: TxRequest):

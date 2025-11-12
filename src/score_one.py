@@ -67,41 +67,26 @@ def fetch_context(eng, tx_id: int) -> pd.DataFrame:
 
     return ctx
 
-def upsert_score(eng, tx_id: int, score: float, label_pred: bool):
-    """
-    UPSERT the score into [SCORE_SCHEMA].[SCORE_TABLE] using a MERGE with parameters.
-    Runs in a transaction to guarantee commit.
-    """
-    threshold = float(os.getenv("THRESHOLD", "0.5"))
-    run_id    = os.getenv("MODEL_VERSION", "unknown")
 
-    merge_sql = f"""
-MERGE [{SCORE_SCHEMA}].[{SCORE_TABLE}] AS tgt
-USING (
-    SELECT
-        CAST(? AS BIGINT)       AS tx_id,
-        CAST(? AS FLOAT)        AS score,
-        CAST(? AS BIT)          AS label_pred,
-        CAST(? AS FLOAT)        AS threshold,
-        CAST(? AS NVARCHAR(64)) AS run_id
-) AS src
-ON (tgt.tx_id = src.tx_id)
-WHEN MATCHED THEN
-    UPDATE SET
-        score        = src.score,
-        label_pred   = src.label_pred,
-        threshold    = src.threshold,
-        run_id       = src.run_id,
-        explained_at = SYSUTCDATETIME(),
-        reason_json  = COALESCE(tgt.reason_json, '{{"source":"model"}}')
-WHEN NOT MATCHED THEN
-    INSERT (tx_id, score, label_pred, threshold, run_id, explained_at, reason_json)
-    VALUES (src.tx_id, src.score, src.label_pred, src.threshold, src.run_id, SYSUTCDATETIME(), '{{"source":"model"}}');
-"""
-    params = (int(tx_id), float(score), 1 if label_pred else 0, threshold, run_id)
-    with eng.begin() as conn:
-        conn.exec_driver_sql(merge_sql, params)
+Query 1
+35363738394041424344454647
+EXEC sp_executesql @sql;
 
+-- Outgoing FKs (ml.TxScores referencing others)
+SET @sql = N'';
+SELECT @sql = @sql + N'ALTER TABLE ' + QUOTENAME(OBJECT_SCHEMA_NAME(parent_object_id)) + N'.' +
+                      QUOTENAME(OBJECT_NAME(parent_object_id)) + N' DROP CONSTRAINT ' + QUOTENAME(name) + N';'
+FROM sys.foreign_keys
+WHERE parent_object_id = @obj_id;
+EXEC sp_executesql @sql;
+
+
+Results
+Messages
+Failed to execute query. Error: Incorrect syntax near 'QUOTENAME'.
+Incorrect syntax near 'QUOTENAME'.
+Incorrect syntax near 'QUOTENAME'.
+Incorrect syntax near 'QUOTENAME'.
 def main():
     """
     CLI usage (optional): python -m src.score_one <tx_id>

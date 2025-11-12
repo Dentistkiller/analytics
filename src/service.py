@@ -291,18 +291,12 @@ def score_path(tx_id: int):
     except LookupError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
-@app.post("/diag/write-test")
-def diag_write_test(tx_id: int = Query(..., description="existing tx_id to test write")):
-    eng = sql_engine()
-    score = 0.123
-    flagged = False
-    thr = float(os.getenv("THRESHOLD", "0.5"))
+
+def upsert_score(eng, tx_id: int, score: float, label_pred: bool):
     run_id = os.getenv("MODEL_VERSION", "kaggle_v1")
+    thr    = float(os.getenv("THRESHOLD", "0.5"))
 
-    # One round-trip: UPDATE/INSERT with OUTPUT into a table var, then SELECT it back.
-    stmt = text("""
-        DECLARE @out TABLE (tx_id BIGINT, score FLOAT, label_pred BIT);
-
+    upd = text("""
         UPDATE [ml].[TxScores]
            SET score        = :score,
                label_pred   = :label,
@@ -310,19 +304,20 @@ def diag_write_test(tx_id: int = Query(..., description="existing tx_id to test 
                run_id       = :run_id,
                explained_at = SYSUTCDATETIME(),
                reason_json  = COALESCE(reason_json, '{"source":"model"}')
-         OUTPUT inserted.tx_id, inserted.score, inserted.label_pred INTO @out
          WHERE tx_id = :tx_id;
+    """).bindparams(
+        bindparam("tx_id",  type_=BigInteger()),
+        bindparam("score",  type_=Float()),
+        bindparam("label",  type_=Boolean()),
+        bindparam("thr",    type_=Float()),
+        bindparam("run_id", type_=NVARCHAR(length=64)),
+    )
 
-        IF @@ROWCOUNT = 0
-        BEGIN
-            INSERT INTO [ml].[TxScores]
-                (tx_id, score, label_pred, threshold, run_id, explained_at, reason_json)
-            OUTPUT inserted.tx_id, inserted.score, inserted.label_pred INTO @out
-            VALUES
-                (:tx_id, :score, :label, :thr, :run_id, SYSUTCDATETIME(), '{"source":"model"}');
-        END
-
-        SELECT TOP(1) tx_id, score, label_pred FROM @out;
+    ins = text("""
+        INSERT INTO [ml].[TxScores]
+            (tx_id, score, label_pred, threshold, run_id, explained_at, reason_json)
+        VALUES
+            (:tx_id, :score, :label, :thr, :run_id, SYSUTCDATETIME(), '{"source":"model"}');
     """).bindparams(
         bindparam("tx_id",  type_=BigInteger()),
         bindparam("score",  type_=Float()),
@@ -332,32 +327,22 @@ def diag_write_test(tx_id: int = Query(..., description="existing tx_id to test 
     )
 
     with eng.begin() as con:
-        row = con.execute(stmt, {
-            "tx_id":  int(tx_id),
-            "score":  float(score),
-            "label":  bool(flagged),
-            "thr":    thr,
+        res = con.execute(upd, {
+            "tx_id": int(tx_id),
+            "score": float(score),
+            "label": bool(label_pred),
+            "thr":   thr,
             "run_id": run_id,
-        }).first()
-
-    if not row:
-        # Return a clear diagnostic instead of crashing with NoneType
-        return {
-            "wrote": False,
-            "reason": "No row returned from OUTPUT (possible DB mismatch or permissions).",
-            "db_hint": {
-                "api_db": os.getenv("SQL_DB"),
-                "table": "ml.TxScores",
-                "tx_id": tx_id
-            }
-        }
-
-    return {
-        "wrote": True,
-        "row": {"tx_id": int(row[0]), "score": float(row[1]), "flagged": bool(row[2])}
-    }
-
-
+        })
+        if res.rowcount == 0:
+            con.execute(ins, {
+                "tx_id": int(tx_id),
+                "score": float(score),
+                "label": bool(label_pred),
+                "thr":   thr,
+                "run_id": run_id,
+            })
+    
 @app.post("/score", response_model=ScoreResponse)
 def score_body(req: TxRequest):
     try:

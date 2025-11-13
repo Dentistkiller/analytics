@@ -3,39 +3,35 @@ import traceback
 from typing import Optional
 
 from dotenv import load_dotenv
-load_dotenv()  # load .env before using env vars
+load_dotenv()  # MUST run before importing modules that read env vars
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.requests import Request
 from pydantic import BaseModel
 
 import pandas as pd
-from sqlalchemy import text, BigInteger, Float, Boolean, NVARCHAR, bindparam
 from sqlalchemy.exc import ResourceClosedError, ProgrammingError
 
+# ---- Local package imports (relative to src/) ----
 from .common import sql_engine
 from .features import engineer
 from .score_one import load_bundle, fetch_context, upsert_score
 
 app = FastAPI(title="VeriPay Scoring API", version=os.getenv("MODEL_VERSION", "unknown"))
 
-# -------- Config: source transactions table --------
+# ---------------- Config for your transactions table ----------------
 TX_SCHEMA = os.getenv("TX_SCHEMA", "ops")
 TX_TABLE  = os.getenv("TX_TABLE",  "Transactions")
-SCORE_SCHEMA = os.getenv("SCORE_SCHEMA", "ml")
-SCORE_TABLE  = os.getenv("SCORE_TABLE",  "TxScores")
 
 def _qn(name: str) -> str:
+    """Quote a SQL Server identifier with brackets."""
     return f"[{name}]"
 
 def _table_2part(schema: str, table: str) -> str:
     return f"{_qn(schema)}.{_qn(table)}"
 
-def _score_tbl() -> str:
-    return _table_2part(SCORE_SCHEMA, SCORE_TABLE)
-
-# -------- Request/Response models --------
+# ---------------- Models ----------------
 class ScoreResponse(BaseModel):
     tx_id: int
     score: float
@@ -48,31 +44,38 @@ class TxRequest(BaseModel):
 class LatestTx(BaseModel):
     tx_id: int
 
-# -------- Model bundle warmup --------
+# ---------------- Global Bundle Warmup ----------------
 BUNDLE = load_bundle()
 MODEL = BUNDLE.get("model")
-THR   = float(BUNDLE.get("threshold", os.getenv("THRESHOLD", 0.5)))
+THR = float(BUNDLE.get("threshold", os.getenv("THRESHOLD", 0.5)))
 FEATS = BUNDLE.get("features") or []
 
-# -------- Error handler (always JSON) --------
+# ---------------- Error Handling ----------------
 @app.exception_handler(Exception)
 async def all_exception_handler(request: Request, exc: Exception):
+    # Always return structured JSON (no blank 500s)
     print("UNHANDLED EXCEPTION:", repr(exc))
     traceback.print_exc()
     return JSONResponse(
         status_code=500,
-        content={"error": type(exc).__name__, "detail": str(exc)},
+        content={
+            "error": type(exc).__name__,
+            "detail": str(exc),
+        },
     )
 
-# -------- Helpers: find an ID column if not named tx_id --------
+# ---------------- Helper: detect PK / ID column ----------------
 def _detect_pk_column(conn) -> str | None:
+    """
+    Return the first PK column name for TX_SCHEMA.TX_TABLE, or None.
+    """
     sql = f"""
     SELECT TOP 1 c.name
     FROM sys.indexes i
     JOIN sys.index_columns ic
-      ON ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.key_ordinal = 1
+        ON ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.key_ordinal = 1
     JOIN sys.columns c
-      ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+        ON c.object_id = ic.object_id AND c.column_id = ic.column_id
     WHERE i.object_id = OBJECT_ID('{TX_SCHEMA}.{TX_TABLE}')
       AND i.is_primary_key = 1
     ORDER BY ic.key_ordinal;
@@ -81,14 +84,20 @@ def _detect_pk_column(conn) -> str | None:
     return row[0] if row else None
 
 def _fallback_id_column(conn) -> str | None:
+    """
+    If no PK, try common names, identity, or the first int/decimal column.
+    """
+    # 1) Common names
     cols = [r[0] for r in conn.exec_driver_sql(f"""
         SELECT COLUMN_NAME
         FROM INFORMATION_SCHEMA.COLUMNS
         WHERE TABLE_SCHEMA = '{TX_SCHEMA}' AND TABLE_NAME = '{TX_TABLE}'
     """).all()]
-    for c in ["tx_id", "TxId", "TransactionId", "TransactionID", "TransId", "Id", "ID"]:
+    for c in ["TxId", "TransactionId", "TransactionID", "TransId", "Id", "ID"]:
         if c in cols:
             return c
+
+    # 2) Identity column
     ident = conn.exec_driver_sql(f"""
         SELECT c.name
         FROM sys.columns c
@@ -98,6 +107,8 @@ def _fallback_id_column(conn) -> str | None:
     """).first()
     if ident:
         return ident[0]
+
+    # 3) Any numeric column
     any_int = conn.exec_driver_sql(f"""
         SELECT TOP 1 COLUMN_NAME
         FROM INFORMATION_SCHEMA.COLUMNS
@@ -116,10 +127,15 @@ def _get_id_column(conn) -> str:
         return fb
     raise HTTPException(status_code=500, detail=f"Could not determine an ID column for {TX_SCHEMA}.{TX_TABLE}")
 
-# -------- Safe context fetch fallback --------
+# ---------------- Safe context fetch (fallback for SA 2.x cursor issues) ----------------
 def _fetch_context_safe(eng, tx_id: int) -> pd.DataFrame:
+    """
+    Safe read of the target tx and some history rows using SQLAlchemy 2.x + pandas.
+    Avoids cursor/Result misuse that triggers ResourceClosedError.
+    """
     with eng.connect() as c:
         id_col = _get_id_column(c)
+    # Pull the target row + up to 1000 previous rows by ID (tune as needed)
     sql = (
         f"SELECT TOP 1000 * "
         f"FROM {_table_2part(TX_SCHEMA, TX_TABLE)} "
@@ -131,11 +147,7 @@ def _fetch_context_safe(eng, tx_id: int) -> pd.DataFrame:
         raise LookupError(f"tx_id {tx_id} not found")
     return df
 
-# -------- Health & diagnostics --------
-@app.get("/")
-def root():
-    return {"message": "VeriPay Scoring API", "version": app.version}
-
+# ---------------- Health & Diagnostics ----------------
 @app.get("/health")
 def health():
     return {"status": "ok", "message": "Service healthy"}
@@ -206,54 +218,34 @@ def db_sample():
 def latest_tx():
     return db_sample()
 
-# --- New: prove DB identity the API is using
-@app.get("/whoami")
-def whoami():
-    eng = sql_engine()
-    with eng.connect() as c:
-        db = c.exec_driver_sql("SELECT DB_NAME()").scalar_one()
-        user = c.exec_driver_sql("SELECT SUSER_SNAME()").scalar_one()
-    return {"db": db, "user": user, "server": os.getenv("SQL_SERVER")}
-
-# --- New: fetch a score row to verify insert/upsert landed
-@app.get("/scores/get/{tx_id}")
-def get_score(tx_id: int):
-    eng = sql_engine()
-    with eng.connect() as c:
-        row = c.exec_driver_sql(
-            f"SELECT tx_id, score, label_pred, threshold, run_id, explained_at "
-            f"FROM {_score_tbl()} WHERE tx_id = ?", (tx_id,)
-        ).first()
-        if not row:
-            return {"found": False}
-        cols = ["tx_id", "score", "label_pred", "threshold", "run_id", "explained_at"]
-        return {"found": True, **{k: row[i] for i, k in enumerate(cols)}}
-
-# -------- Core Scoring --------
+# ---------------- Core Scoring ----------------
 def _score_single_tx(tx_id: int) -> ScoreResponse:
     eng = sql_engine()
 
-    # Prefer project fetch; fall back to safe fetch on SA 2.x result/cursor quirks.
+    # 1) Try the project's original fetch (good if already SA 2.x-safe).
+    # 2) If it raises due to result handling (ResourceClosedError/ProgrammingError),
+    #    or anything else, fallback to the safe SELECT approach.
     try:
         df = fetch_context(eng, tx_id)
     except LookupError:
+        # propagate 'not found' cleanly
         raise
     except (ResourceClosedError, ProgrammingError):
         df = _fetch_context_safe(eng, tx_id)
     except Exception:
         df = _fetch_context_safe(eng, tx_id)
 
-    # Feature engineering
+    # Feature engineering (non-training path)
     X, _, meta, _ = engineer(df, is_training=False)
 
-    # Align to training features
+    # Align to training feature set
     for c in FEATS:
         if c not in X.columns:
             X[c] = 0.0
     if FEATS:
         X = X[FEATS].fillna(0.0)
 
-    # Pick row for this tx
+    # Select the row corresponding to this tx_id (fallback to last row)
     row_index = None
     if hasattr(meta, "columns") and "tx_id" in meta.columns:
         hits = meta.index[meta["tx_id"] == tx_id]
@@ -272,10 +264,14 @@ def _score_single_tx(tx_id: int) -> ScoreResponse:
 
     flagged = bool(score >= THR)
 
-    # Persist score (do NOT swallow errors; let 500 surface if perms/firewall wrong)
-    upsert_score(eng, tx_id, score, flagged)
+    # Persist score for UI consumption
+    try:
+        upsert_score(eng, tx_id, score, flagged)
+    except (ResourceClosedError, ProgrammingError):
+        # Common in SA 2.x when executing non-SELECT statements; ignore result reading
+        pass
 
-    # Optional explanation
+    # Optional explanations (if available)
     explanation = None
     try:
         from . import explain
@@ -293,75 +289,13 @@ def score_path(tx_id: int):
     except LookupError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
-@app.post("/diag/write-test")
-def diag_write_test(tx_id: int = Query(...)):
-    eng = sql_engine()
-    score  = 0.123
-    flagged = False
-    thr    = float(os.getenv("THRESHOLD", "0.5"))
-    tbl    = _score_tbl()
-
-    # UPDATE without run_id
-    upd_sql = text(f"""
-        UPDATE {tbl}
-           SET score        = :score,
-               label_pred   = :label,
-               threshold    = :thr,
-               explained_at = SYSUTCDATETIME(),
-               reason_json  = COALESCE(reason_json, '{{"source":"model"}}')
-         WHERE tx_id = :tx_id;
-    """).bindparams(
-        bindparam("tx_id",  type_=BigInteger()),
-        bindparam("score",  type_=Float()),
-        bindparam("label",  type_=Boolean()),
-        bindparam("thr",    type_=Float()),
-    )
-
-    # INSERT without run_id
-    ins_sql = text(f"""
-        INSERT INTO {tbl}
-            (tx_id, score, label_pred, threshold, explained_at, reason_json)
-        VALUES
-            (:tx_id, :score, :label, :thr, SYSUTCDATETIME(), '{{"source":"model"}}');
-    """).bindparams(
-        bindparam("tx_id",  type_=BigInteger()),
-        bindparam("score",  type_=Float()),
-        bindparam("label",  type_=Boolean()),
-        bindparam("thr",    type_=Float()),
-    )
-
-    sel_sql = text("""
-        SELECT tx_id, score, label_pred
-        FROM {tbl}
-        WHERE tx_id = :tx_id;
-    """.format(tbl=tbl)).bindparams(bindparam("tx_id", type_=BigInteger()))
-
-    params = {
-        "tx_id":  int(tx_id),
-        "score":  float(score),
-        "label":  bool(flagged),
-        "thr":    thr,
-    }
-
-    with eng.begin() as con:
-        upd_res = con.execute(upd_sql, params)
-        if upd_res.rowcount == 0:
-            con.execute(ins_sql, params)
-        row = con.execute(sel_sql, {"tx_id": int(tx_id)}).first()
-
-    if not row:
-        return {
-            "wrote": False,
-            "reason": "Row not visible after write (DB mismatch/permissions).",
-            "db_hint": {"api_db": os.getenv("SQL_DB"), "table": f"{SCORE_SCHEMA}.{SCORE_TABLE}", "tx_id": tx_id}
-        }
-
-    return {"wrote": True, "row": {"tx_id": int(row[0]), "score": float(row[1]), "flagged": bool(row[2])}}
-
-
 @app.post("/score", response_model=ScoreResponse)
 def score_body(req: TxRequest):
     try:
         return _score_single_tx(req.tx_id)
     except LookupError as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+@app.get("/")
+def root():
+    return {"message": "VeriPay Scoring API", "version": app.version}

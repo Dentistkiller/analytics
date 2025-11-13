@@ -97,16 +97,15 @@ def _get_txscores_txid_type(conn):
 
 # ---------- Adaptive upsert ----------
 def upsert_score(eng, tx_id: int, score: float, label_pred: bool):
-    run_id = os.getenv("MODEL_VERSION", "kaggle_v1")
     thr    = float(os.getenv("THRESHOLD", "0.5"))
     tbl    = _tbl(SCORE_SCHEMA, SCORE_TABLE)
 
+    # UPDATE without run_id
     upd = text(f"""
         UPDATE {tbl}
            SET score        = :score,
                label_pred   = :label,
                threshold    = :thr,
-               run_id       = :run_id,
                explained_at = SYSUTCDATETIME(),
                reason_json  = COALESCE(reason_json, '{{"source":"model"}}')
          WHERE tx_id = :tx_id;
@@ -115,20 +114,19 @@ def upsert_score(eng, tx_id: int, score: float, label_pred: bool):
         bindparam("score",  type_=Float()),
         bindparam("label",  type_=Boolean()),
         bindparam("thr",    type_=Float()),
-        bindparam("run_id", type_=NVARCHAR(length=64)),
     )
 
+    # INSERT without run_id
     ins = text(f"""
         INSERT INTO {tbl}
-            (tx_id, score, label_pred, threshold, run_id, explained_at, reason_json)
+            (tx_id, score, label_pred, threshold, explained_at, reason_json)
         VALUES
-            (:tx_id, :score, :label, :thr, :run_id, SYSUTCDATETIME(), '{{"source":"model"}}');
+            (:tx_id, :score, :label, :thr, SYSUTCDATETIME(), '{{"source":"model"}}');
     """).bindparams(
         bindparam("tx_id",  type_=BigInteger()),
         bindparam("score",  type_=Float()),
         bindparam("label",  type_=Boolean()),
         bindparam("thr",    type_=Float()),
-        bindparam("run_id", type_=NVARCHAR(length=64)),
     )
 
     with eng.begin() as con:
@@ -137,7 +135,6 @@ def upsert_score(eng, tx_id: int, score: float, label_pred: bool):
             "score": float(score),
             "label": bool(label_pred),
             "thr":   thr,
-            "run_id": run_id,
         })
         if res.rowcount == 0:
             con.execute(ins, {
@@ -145,7 +142,6 @@ def upsert_score(eng, tx_id: int, score: float, label_pred: bool):
                 "score": float(score),
                 "label": bool(label_pred),
                 "thr":   thr,
-                "run_id": run_id,
             })
 
 # ---------- CLI main ----------

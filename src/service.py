@@ -299,15 +299,14 @@ def diag_write_test(tx_id: int = Query(...)):
     score  = 0.123
     flagged = False
     thr    = float(os.getenv("THRESHOLD", "0.5"))
-    run_id = os.getenv("MODEL_VERSION", "kaggle_v1")
     tbl    = _score_tbl()
 
+    # UPDATE without run_id
     upd_sql = text(f"""
         UPDATE {tbl}
            SET score        = :score,
                label_pred   = :label,
                threshold    = :thr,
-               run_id       = :run_id,
                explained_at = SYSUTCDATETIME(),
                reason_json  = COALESCE(reason_json, '{{"source":"model"}}')
          WHERE tx_id = :tx_id;
@@ -316,20 +315,19 @@ def diag_write_test(tx_id: int = Query(...)):
         bindparam("score",  type_=Float()),
         bindparam("label",  type_=Boolean()),
         bindparam("thr",    type_=Float()),
-        bindparam("run_id", type_=NVARCHAR(length=64)),
     )
 
+    # INSERT without run_id
     ins_sql = text(f"""
         INSERT INTO {tbl}
-            (tx_id, score, label_pred, threshold, run_id, explained_at, reason_json)
+            (tx_id, score, label_pred, threshold, explained_at, reason_json)
         VALUES
-            (:tx_id, :score, :label, :thr, :run_id, SYSUTCDATETIME(), '{{"source":"model"}}');
+            (:tx_id, :score, :label, :thr, SYSUTCDATETIME(), '{{"source":"model"}}');
     """).bindparams(
         bindparam("tx_id",  type_=BigInteger()),
         bindparam("score",  type_=Float()),
         bindparam("label",  type_=Boolean()),
         bindparam("thr",    type_=Float()),
-        bindparam("run_id", type_=NVARCHAR(length=64)),
     )
 
     sel_sql = text("""
@@ -343,7 +341,6 @@ def diag_write_test(tx_id: int = Query(...)):
         "score":  float(score),
         "label":  bool(flagged),
         "thr":    thr,
-        "run_id": run_id,
     }
 
     with eng.begin() as con:
@@ -360,6 +357,7 @@ def diag_write_test(tx_id: int = Query(...)):
         }
 
     return {"wrote": True, "row": {"tx_id": int(row[0]), "score": float(row[1]), "flagged": bool(row[2])}}
+
 
 @app.post("/score", response_model=ScoreResponse)
 def score_body(req: TxRequest):
